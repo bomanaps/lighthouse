@@ -3,6 +3,8 @@ use crate::attestation_verification::{
     Error as AttestationError, VerifiedAggregatedAttestation, VerifiedAttestation,
     VerifiedUnaggregatedAttestation,
 };
+use std::collections::VecDeque;
+use std::fmt;
 use crate::attester_cache::{AttesterCache, AttesterCacheKey};
 use crate::beacon_block_streamer::{BeaconBlockStreamer, CheckCaches};
 use crate::beacon_proposer_cache::compute_proposer_duties_from_head;
@@ -337,9 +339,103 @@ pub enum BlockProcessStatus<E: EthSpec> {
     /// missing block components.
     ExecutionValidated(Arc<SignedBeaconBlock<E>>),
 }
+#[derive(Clone)]
+pub struct TimingMetrics {
+    pub times: VecDeque<Duration>,
+    pub total: Duration,
+    pub max_size: usize,
+}
 
+impl Default for TimingMetrics {
+    fn default() -> Self {
+        Self::new(100) // Default max_size of 100
+    }
+}
+
+impl TimingMetrics {
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            times: VecDeque::with_capacity(max_size),
+            total: Duration::default(),
+            max_size,
+        }
+    }
+
+    pub fn update(&mut self, duration: Duration) {
+        if self.times.len() >= self.max_size {
+            if let Some(old) = self.times.pop_front() {
+                self.total -= old;
+            }
+        }
+        self.times.push_back(duration);
+        self.total += duration;
+    }
+
+    pub fn min(&self) -> Option<Duration> {
+        self.times.iter().min().copied()
+    }
+
+    pub fn max(&self) -> Option<Duration> {
+        self.times.iter().max().copied()
+    }
+
+    pub fn average(&self) -> Option<Duration> {
+        (!self.times.is_empty()).then(|| self.total / self.times.len() as u32)
+    }
+
+    pub fn median(&self) -> Option<Duration> {
+        let len = self.times.len();
+        if len == 0 {
+            return None;
+        }
+        let mut sorted: Vec<_> = self.times.iter().collect();
+        sorted.sort();
+        let mid_idx = len / 2;
+        Some((*sorted[mid_idx] + *sorted[len - 1 - mid_idx]) / 2)
+    }
+
+    pub fn count(&self) -> usize {
+        self.times.len()
+    }
+
+    pub fn last(&self) -> Option<Duration> {
+        self.times.back().copied()
+    }
+
+    pub fn total(&self) -> Duration {
+        self.total
+    }
+
+    pub fn times(&self) -> &VecDeque<Duration> {
+        &self.times
+    }
+
+    fn to_milliseconds(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1000.0
+    }
+}
+
+impl fmt::Display for TimingMetrics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.times.is_empty() {
+            write!(f, "Timing metrics are empty.")
+        } else {
+            let min_ms = self.min().map(Self::to_milliseconds).unwrap_or(0.0);
+            let max_ms = self.max().map(Self::to_milliseconds).unwrap_or(0.0);
+            let avg_ms = self.average().map(Self::to_milliseconds).unwrap_or(0.0);
+            let median_ms = self.median().map(Self::to_milliseconds).unwrap_or(0.0);
+            
+            write!(
+                f,
+                "Min: {:.1}ms, Max: {:.1}ms, Avg: {:.1}ms, Median: {:.1}ms",
+                min_ms, max_ms, avg_ms, median_ms
+            )
+        }
+    }
+}
 pub struct BeaconChainMetrics {
     pub reqresp_pre_import_cache_len: usize,
+    metrics: Mutex<HashMap<String, TimingMetrics>>,
 }
 
 pub type LightClientProducerEvent<T> = (Hash256, Slot, SyncAggregate<T>);
@@ -6800,7 +6896,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     pub fn metrics(&self) -> BeaconChainMetrics {
         BeaconChainMetrics {
             reqresp_pre_import_cache_len: self.reqresp_pre_import_cache.read().len(),
-        }
+            metrics: self.metrics().metrics.lock().clone().into(),
+        }  // <-- Close the BeaconChainMetrics struct here
     }
 }
 
